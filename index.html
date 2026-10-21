@@ -1,0 +1,500 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>실시간 얼굴 추적</title>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #10151c;
+      color: #f1f5f9;
+      font-family: Arial, sans-serif;
+    }
+
+    h1 { text-align: center; font-size: 26px; }
+
+    .app {
+      max-width: 1000px;
+      margin: auto;
+    }
+
+    .status {
+      padding: 12px;
+      margin: 14px 0;
+      background: #202a36;
+      border-radius: 10px;
+      text-align: center;
+      color: #a9f5bd;
+    }
+
+    .viewer {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      background: #000;
+      overflow: hidden;
+      border: 2px solid #293746;
+      border-radius: 14px;
+    }
+
+    video, canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      transform: scaleX(-1);
+    }
+
+    video { background: #000; }
+    canvas { pointer-events: none; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .metric {
+      padding: 14px 8px;
+      background: #202a36;
+      border-radius: 10px;
+      text-align: center;
+    }
+
+    .metric span {
+      display: block;
+      color: #9caec0;
+      font-size: 13px;
+      margin-bottom: 7px;
+    }
+
+    .metric strong {
+      font-size: 19px;
+      color: #69f0a0;
+      overflow-wrap: anywhere;
+    }
+
+    button {
+      display: block;
+      margin: 16px auto;
+      padding: 12px 22px;
+      background: #16a34a;
+      border: 0;
+      border-radius: 9px;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    .help {
+      color: #b5c2d0;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 500px) {
+      body { padding: 10px; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+
+<body>
+<main class="app">
+  <h1>🟢 실시간 얼굴 추적</h1>
+
+  <div id="status" class="status">
+    카메라와 얼굴 인식 모델을 준비하고 있습니다...
+  </div>
+
+  <div class="viewer">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <span>X 위치</span>
+      <strong id="x">--</strong>
+    </div>
+    <div class="metric">
+      <span>Y 위치</span>
+      <strong id="y">--</strong>
+    </div>
+    <div class="metric">
+      <span>Z 거리 추정</span>
+      <strong id="z">--</strong>
+    </div>
+    <div class="metric">
+      <span>Pitch</span>
+      <strong id="pitch">--</strong>
+    </div>
+    <div class="metric">
+      <span>Yaw</span>
+      <strong id="yaw">--</strong>
+    </div>
+    <div class="metric">
+      <span>Roll</span>
+      <strong id="roll">--</strong>
+    </div>
+  </div>
+
+  <button id="startButton">카메라 시작 / 다시 연결</button>
+
+  <p class="help">
+    초록색 테두리: 얼굴 영역<br>
+    초록색 점: 눈, 코, 입, 턱의 특징점<br>
+    파란색 십자: 얼굴 중심<br>
+    X/Y는 영상 중심 기준 픽셀, Z는 얼굴 크기에 따른 상대 거리 추정값입니다.
+    Pitch/Yaw/Roll은 2D 얼굴 특징점으로 계산한 대략적인 각도이며
+    정밀한 3D 측정값은 아닙니다.
+  </p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+<script>
+(() => {
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const status = document.getElementById("status");
+  const startButton = document.getElementById("startButton");
+
+  const MODEL_URL =
+    "https://justadudewhohacks.github.io/face-api.js/models";
+
+  let stream = null;
+  let running = false;
+  let busy = false;
+  let modelsReady = false;
+  let animationId = null;
+  let lastDetect = 0;
+  let previous = {};
+  let referenceFaceWidth = null;
+  let missingFrames = 0;
+
+  function setStatus(message, error = false) {
+    status.textContent = message;
+    status.style.color = error ? "#ff9696" : "#a9f5bd";
+  }
+
+  function smooth(key, value, factor = 0.35) {
+    if (!Number.isFinite(value)) return 0;
+
+    if (previous[key] === undefined) {
+      previous[key] = value;
+    } else {
+      previous[key] =
+        previous[key] * (1 - factor) + value * factor;
+    }
+
+    return previous[key];
+  }
+
+  function show(id, value, suffix = "") {
+    document.getElementById(id).textContent =
+      Number.isFinite(value) ? value.toFixed(1) + suffix : "--";
+  }
+
+  function resetMetrics() {
+    ["x", "y", "z", "pitch", "yaw", "roll"].forEach(id => {
+      document.getElementById(id).textContent = "--";
+    });
+  }
+
+  async function loadModels() {
+    if (modelsReady) return;
+
+    if (!window.faceapi) {
+      throw new Error(
+        "얼굴 인식 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하세요."
+      );
+    }
+
+    setStatus("얼굴 인식 모델을 다운로드하고 있습니다...");
+
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+    ]);
+
+    modelsReady = true;
+  }
+
+  async function startCamera() {
+    startButton.disabled = true;
+
+    try {
+      setStatus("카메라를 연결하고 있습니다...");
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "이 환경에서는 카메라를 사용할 수 없습니다. HTTPS 주소로 접속하세요."
+        );
+      }
+
+      await loadModels();
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      await new Promise(resolve => {
+        if (video.videoWidth > 0) return resolve();
+        video.addEventListener("loadedmetadata", resolve, {
+          once: true
+        });
+      });
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      previous = {};
+      referenceFaceWidth = null;
+      missingFrames = 0;
+      lastDetect = 0;
+      running = true;
+
+      setStatus("카메라 연결 완료 — 얼굴을 찾고 있습니다.");
+      if (animationId) cancelAnimationFrame(animationId);
+      animationId = requestAnimationFrame(loop);
+
+    } catch (error) {
+      running = false;
+      console.error(error);
+
+      let message = error.message || "알 수 없는 오류";
+
+      if (error.name === "NotAllowedError") {
+        message =
+          "카메라 권한이 거부되었습니다. 주소창 왼쪽의 사이트 설정에서 카메라를 허용하세요.";
+      } else if (error.name === "NotFoundError") {
+        message = "사용 가능한 카메라를 찾지 못했습니다.";
+      } else if (error.name === "NotReadableError") {
+        message =
+          "카메라를 사용할 수 없습니다. 다른 앱에서 카메라를 사용 중인지 확인하세요.";
+      }
+
+      setStatus("오류: " + message, true);
+    } finally {
+      startButton.disabled = false;
+    }
+  }
+
+  function drawFace(box, points) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 초록색 얼굴 테두리
+    ctx.strokeStyle = "#00ff66";
+    ctx.lineWidth = Math.max(2, canvas.width / 320);
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+    // 얼굴 특징점
+    ctx.fillStyle = "#00ff66";
+
+    for (const p of points) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, Math.max(1.8, canvas.width / 260), 0,
+        Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 얼굴 중심 추적 십자
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    const size = Math.max(10, canvas.width / 40);
+
+    ctx.strokeStyle = "#63b3ff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, size * 0.55, 0, Math.PI * 2);
+    ctx.moveTo(cx - size, cy);
+    ctx.lineTo(cx + size, cy);
+    ctx.moveTo(cx, cy - size);
+    ctx.lineTo(cx, cy + size);
+    ctx.stroke();
+
+    // 얼굴 중심 좌표
+    ctx.fillStyle = "#00ff66";
+    ctx.font = "16px Arial";
+    ctx.fillText(
+      "TRACKING",
+      Math.max(5, box.x),
+      Math.max(20, box.y - 8)
+    );
+  }
+
+  function calculatePose(box, points) {
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // 68개 얼굴 특징점 중 눈과 코의 위치
+    const leftEye = points.slice(36, 42);
+    const rightEye = points.slice(42, 48);
+    const nose = points[30];
+
+    function average(arr) {
+      return {
+        x: arr.reduce((sum, p) => sum + p.x, 0) / arr.length,
+        y: arr.reduce((sum, p) => sum + p.y, 0) / arr.length
+      };
+    }
+
+    const le = average(leftEye);
+    const re = average(rightEye);
+    const eyeCenterX = (le.x + re.x) / 2;
+    const eyeCenterY = (le.y + re.y) / 2;
+    const eyeDistance = Math.max(1, Math.hypot(
+      re.x - le.x, re.y - le.y
+    ));
+
+    // X/Y: 영상 중심 기준 픽셀
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+
+    show("x", smooth("x", cx - W / 2));
+    show("y", smooth("y", cy - H / 2));
+
+    // Z: 실제 거리(cm)가 아닌 상대적인 거리 지표
+    if (referenceFaceWidth === null) {
+      referenceFaceWidth = box.width;
+    }
+
+    const relativeDistance =
+      referenceFaceWidth / Math.max(1, box.width);
+
+    show("z", smooth("z", relativeDistance, 0.2));
+
+    // Roll: 양쪽 눈을 잇는 선의 기울기
+    const rollRad = Math.atan2(
+      re.y - le.y,
+      re.x - le.x
+    );
+
+    const roll = rollRad * 180 / Math.PI;
+
+    // Yaw: 코가 양쪽 눈 중심에서 좌우로 벗어난 정도
+    const yaw = Math.atan(
+      (nose.x - eyeCenterX) / eyeDistance
+    ) * 180 / Math.PI;
+
+    // Pitch: 코의 수직 위치를 눈 간격과 얼굴 높이로 정규화
+    const normalizedNoseY =
+      (nose.y - eyeCenterY) / eyeDistance;
+
+    const pitch = (
+      normalizedNoseY - 0.55
+    ) * 35;
+
+    show("roll", smooth("roll", roll), "°");
+    show("yaw", smooth("yaw", yaw), "°");
+    show("pitch", smooth("pitch", pitch), "°");
+  }
+
+  async function loop(timestamp) {
+    if (!running) return;
+
+    animationId = requestAnimationFrame(loop);
+
+    if (
+      busy ||
+      video.readyState < 2 ||
+      timestamp - lastDetect < 60
+    ) {
+      return;
+    }
+
+    busy = true;
+    lastDetect = timestamp;
+
+    try {
+      const results = await faceapi
+        .detectAllFaces(
+          video,
+          new faceapi.TinyFaceDetectorOptions({
+            inputSize: 320,
+            scoreThreshold: 0.45
+          })
+        )
+        .withFaceLandmarks();
+
+      if (!running) return;
+
+      if (results.length > 0) {
+        // 가장 큰 얼굴을 추적
+        const result = results.reduce((a, b) =>
+          a.detection.box.width > b.detection.box.width ? a : b
+        );
+
+        const box = result.detection.box;
+        const points = result.landmarks.positions;
+
+        drawFace(box, points);
+        calculatePose(box, points);
+
+        missingFrames = 0;
+        setStatus("🟢 얼굴 추적 중 — 특징점 68개 감지");
+      } else {
+        missingFrames++;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        resetMetrics();
+
+        if (missingFrames < 10) {
+          setStatus("얼굴을 찾고 있습니다...");
+        } else {
+          setStatus(
+            "얼굴이 감지되지 않습니다. 카메라를 향해 얼굴을 보여주세요."
+          );
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      setStatus("얼굴 추적 중 오류가 발생했습니다.", true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  startButton.addEventListener("click", startCamera);
+
+  // 페이지를 열면 카메라 시작을 자동으로 시도
+  window.addEventListener("load", () => {
+    startCamera();
+  });
+
+  // 페이지를 떠날 때 카메라 정리
+  window.addEventListener("pagehide", () => {
+    running = false;
+
+    if (animationId) cancelAnimationFrame(animationId);
+
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+  });
+})();
+</script>
+</body>
+</html>
